@@ -1,0 +1,8 @@
+{
+  "name": "The Agency: AI Specialists",
+  "description": "An interactive workspace, team builder, and chat playground for The Agency's 144 specialized AI agent personalities.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
