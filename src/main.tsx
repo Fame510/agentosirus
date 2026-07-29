@@ -4,25 +4,61 @@ import App from "./App.tsx";
 import "./index.css";
 import { installApiShim } from "./lib/apiShim";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { hasAnyProvider, activeProviders } from "./lib/keyVault";
-import { KeyRound } from "lucide-react";
+import { MindMap } from "./components/MindMap";
+import { loadConfig, routableProviders } from "./lib/keyVault";
+import { PROVIDER_MAP } from "./lib/providers";
+import { integrationStatus } from "./lib/integrations";
+import { subscribeGraph } from "./lib/activityBus";
+import { KeyRound, Network, X, Github, Globe, Chrome, Clapperboard } from "lucide-react";
 
 // Answer /api/* inside the browser so the app runs on static hosting.
 installApiShim();
 
+function StatusPill({ ok, label, Icon }: { ok: boolean; label: string; Icon: typeof Github }) {
+  return (
+    <span
+      title={label + (ok ? " connected" : " not configured")}
+      className={
+        "flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase transition duration-200 hover:-translate-y-0.5 " +
+        (ok ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-400")
+      }
+    >
+      <Icon size={11} /> {label}
+    </span>
+  );
+}
+
 function Shell() {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [providers, setProviders] = useState<string[]>(activeProviders());
+  const [mapOpen, setMapOpen] = useState(false);
+  const [providers, setProviders] = useState<string[]>([]);
+  const [status, setStatus] = useState<Record<string, boolean>>({});
+  const [running, setRunning] = useState(false);
+  const [activeAgents, setActiveAgents] = useState(0);
+
+  const syncConfig = () => {
+    const config = loadConfig();
+    setProviders(routableProviders(config).map((id) => PROVIDER_MAP[id].label));
+    integrationStatus().then(setStatus);
+  };
 
   useEffect(() => {
-    const sync = () => setProviders(activeProviders());
-    window.addEventListener("agentosirus:config-changed", sync);
-    return () => window.removeEventListener("agentosirus:config-changed", sync);
+    syncConfig();
+    window.addEventListener("agentosirus:config-changed", syncConfig);
+    return () => window.removeEventListener("agentosirus:config-changed", syncConfig);
   }, []);
 
-  // Open the vault automatically on a first visit with no keys configured.
+  // Auto-open the map when a swarm starts so work is visible as it happens.
+  useEffect(() =>
+    subscribeGraph((graph) => {
+      setRunning(graph.running);
+      setActiveAgents(graph.nodes.length);
+      if (graph.running && graph.nodes.length > 0) setMapOpen(true);
+    }), []);
+
+  // Open the control room on a first visit with nothing configured.
   useEffect(() => {
-    if (!hasAnyProvider()) setSettingsOpen(true);
+    if (routableProviders(loadConfig()).length === 0) setSettingsOpen(true);
   }, []);
 
   const configured = providers.length > 0;
@@ -31,24 +67,63 @@ function Shell() {
     <>
       <App />
 
-      <button
-        onClick={() => setSettingsOpen(true)}
-        title={configured ? "Providers active: " + providers.join(", ") : "No API key configured"}
-        className={
-          "fixed bottom-5 right-5 z-[90] flex items-center gap-2 rounded-full px-4 py-3 font-mono text-xs uppercase shadow-xl backdrop-blur transition " +
-          (configured
-            ? "border border-cyan-500/40 bg-slate-900/90 text-cyan-300 hover:bg-slate-800"
-            : "border border-amber-500/50 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25")
-        }
-      >
-        <KeyRound size={15} />
-        <span className="hidden sm:inline">{configured ? providers.join(" / ") : "Add API key"}</span>
-        <span
-          className={
-            "h-2 w-2 rounded-full " + (configured ? "bg-emerald-400 shadow-[0_0_8px_#34d399]" : "bg-amber-400")
-          }
-        />
-      </button>
+      {/* Floating control dock */}
+      <div className="fixed bottom-5 right-5 z-[90] flex flex-col items-end gap-2">
+        <div className="flex flex-wrap justify-end gap-1.5 rounded-2xl border border-white/80 bg-white/85 px-2.5 py-2 shadow-lg backdrop-blur">
+          <StatusPill ok={Boolean(status.github)} label="GitHub" Icon={Github} />
+          <StatusPill ok={Boolean(status.firecrawl)} label="Firecrawl" Icon={Globe} />
+          <StatusPill ok={Boolean(status.playwright)} label="Browser" Icon={Chrome} />
+          <StatusPill ok={Boolean(status.kling)} label="Kling" Icon={Clapperboard} />
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => setMapOpen((v) => !v)}
+            title="Toggle the live mind map"
+            className={
+              "group flex items-center gap-2 rounded-2xl px-4 py-3 text-xs font-extrabold uppercase tracking-wide shadow-xl backdrop-blur transition duration-200 hover:-translate-y-1 hover:shadow-2xl " +
+              (running
+                ? "bg-gradient-to-r from-emerald-400 to-teal-500 text-white"
+                : "border border-indigo-200 bg-white/90 text-indigo-600")
+            }
+          >
+            <Network size={15} className={running ? "animate-pulse" : "transition group-hover:rotate-12"} />
+            <span className="hidden sm:inline">{running ? "Live \u00b7 " + activeAgents + " agents" : "Mind map"}</span>
+          </button>
+
+          <button
+            onClick={() => setSettingsOpen(true)}
+            title={configured ? "Active: " + providers.join(", ") : "No provider configured yet"}
+            className={
+              "group flex items-center gap-2 rounded-2xl px-4 py-3 text-xs font-extrabold uppercase tracking-wide text-white shadow-xl transition duration-200 hover:-translate-y-1 hover:shadow-2xl " +
+              (configured
+                ? "bg-gradient-to-r from-indigo-500 via-fuchsia-500 to-amber-400"
+                : "bg-gradient-to-r from-amber-400 to-orange-500 animate-pulse")
+            }
+          >
+            <KeyRound size={15} className="transition group-hover:rotate-12" />
+            <span className="hidden sm:inline">
+              {configured ? providers.length + " provider" + (providers.length === 1 ? "" : "s") : "Add keys"}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      {/* Mind map drawer */}
+      {mapOpen && (
+        <div className="fixed inset-x-0 bottom-0 z-[95] p-4 sm:inset-x-auto sm:right-5 sm:w-[760px]">
+          <div className="relative">
+            <button
+              onClick={() => setMapOpen(false)}
+              className="absolute -top-2 right-2 z-10 rounded-full bg-white p-1.5 text-slate-400 shadow-lg transition hover:rotate-90 hover:text-indigo-500"
+              aria-label="Close mind map"
+            >
+              <X size={14} />
+            </button>
+            <MindMap />
+          </div>
+        </div>
+      )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </>
