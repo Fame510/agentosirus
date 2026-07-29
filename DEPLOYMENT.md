@@ -1,120 +1,201 @@
-# AgentOsirus — Live App Deployment
+# AgentOsirus — Live App Guide
 
-AgentOsirus now runs as a **fully client-side app on GitHub Pages**. There is no
-server to host, no environment variables to configure on a host, and no secrets
-stored in this repository. You paste your API keys into the running app and they
-stay in your own browser.
+AgentOsirus runs as a **fully client-side app on GitHub Pages**. There is no server to host,
+no environment variables to configure on a host, and **no secrets stored in this repository**.
+You paste your keys into the running app and they stay in your own browser's local storage.
 
----
-
-## 1. Live URL
-
-Once the deploy workflow finishes, the app is live at:
+Live URL:
 
 ```
 https://fame510.github.io/agentosirus/
 ```
 
-## 2. One-time repository setup
+---
 
-GitHub Pages must be told to publish from Actions:
+## 1. One-time repository setup
 
-1. Open **Settings → Pages** in this repository.
+GitHub Pages must publish from Actions:
+
+1. Open **Settings → Pages**.
 2. Under **Build and deployment → Source**, choose **GitHub Actions**.
 3. Save.
 
-That's it. Every push to `main` rebuilds and redeploys automatically.
-You can also trigger it manually from **Actions → Deploy to GitHub Pages → Run workflow**.
+Every push to `main` rebuilds and redeploys. You can also run it manually from
+**Actions → Deploy to GitHub Pages → Run workflow**.
 
-## 3. Entering your keys
+---
 
-Open the live URL. On a first visit the **Local Key Vault** opens automatically.
-You can reopen it any time with the key button in the bottom-right corner.
+## 2. How it works without a server
 
-Add one or more keys. The app tries them in this order on every request:
-
-| Tier | Provider | Where to get a key |
-|------|----------|--------------------|
-| 1 (primary)   | SiliconFlow | https://cloud.siliconflow.cn/account/ak |
-| 2 (secondary) | OpenRouter  | https://openrouter.ai/keys |
-| 3 (fallback)  | Gemini      | https://aistudio.google.com/apikey |
-
-Press **Test** next to a key to verify it with a live round trip, then **Save keys**.
-A saved key takes effect on the very next request — no rebuild, no reload.
-
-### Where the keys live
-
-- Stored in your browser's `localStorage` under `agentosirus.keyvault.v1`.
-- Sent **only** to the provider endpoint you enabled, directly from your browser.
-- Never committed to the repo, never sent to GitHub, never sent to any third party.
-- **Wipe keys** in the vault clears them from this device instantly.
-
-Because requests go straight from your browser to the provider, your key is
-visible in your own browser's network tab. That is expected for a static app.
-Use a key with billing limits, and avoid entering keys on a shared computer.
-
-## 4. What changed from the server version
-
-The original app used `server.ts` (Express) to scan agent markdown at request
-time and proxy AI calls with server-side keys. Static hosting can't run that, so
-the same behavior was moved into the browser:
-
-| Original server route | Replacement |
+| Original server behaviour | Static replacement |
 |---|---|
-| `GET /api/divisions` | Prebuilt `public/agents-index.json` |
-| `GET /api/agents` | Prebuilt `public/agents-index.json` |
-| `GET /api/agents/:category/:id` | Prebuilt `public/agents-content/<slug>.md` |
-| `POST /api/chat` | `src/lib/llm.ts` calls the provider directly |
-| `POST /api/chain` | `src/lib/apiShim.ts` runs the multi-agent chain in-browser |
-| `POST /api/scrape` | Browser fetch through a configurable read proxy |
+| Express scanned agent markdown at request time | `scripts/build-agent-index.mjs` pre-indexes every agent into `public/agents-index.json` + `public/agents-content/*.md` at build time |
+| `/api/*` endpoints | `src/lib/apiShim.ts` patches `window.fetch` and answers `/api/*` in-browser |
+| Server-held API keys | `src/lib/keyVault.ts` — browser-local vault, never transmitted anywhere except the provider you chose |
+| Server-side URL scraping | Firecrawl → local Playwright companion → public CORS proxy → direct fetch, in that order |
 
-`src/lib/apiShim.ts` patches `window.fetch` and answers `/api/*` locally, so
-**every existing React component works unchanged.**
+The original UI components (`App.tsx`, `MasterAgentHub.tsx`, `AgentChat.tsx`, `TeamBuilder.tsx`,
+`LiveSandbox.tsx`, `AgentDetail.tsx`, `AgentCard.tsx`) were **not modified** — they still call
+`/api/...` and the shim answers them.
 
-New files:
+---
 
-- `scripts/build-agent-index.mjs` — scans all agent markdown at build time and emits static JSON + markdown.
-- `src/lib/keyVault.ts` — local key storage.
-- `src/lib/llm.ts` — three-tier provider chain with model fallback.
-- `src/lib/apiShim.ts` — in-browser `/api/*` router.
-- `src/components/SettingsPanel.tsx` — the key vault UI.
-- `.github/workflows/deploy-pages.yml` — build and deploy to Pages.
+## 3. Settings console
 
-`server.ts` is retained for local full-stack use but is no longer required.
+Open the live URL. On a first visit the settings console opens automatically.
+Reopen it any time from the floating dock in the bottom-right corner.
 
-## 5. Running locally
+It has two tabs.
+
+### Tab 1 — AI Models
+
+Every provider below has its own key field, a model dropdown, an editable endpoint, and a
+**Test** button that makes one real call so you can confirm the key works before relying on it.
+
+| Provider | Free models included | Get a key |
+|---|---|---|
+| Ollama (local, keyless) | all local models | https://ollama.com/download |
+| OpenRouter | `:free` variants (DeepSeek R1, Llama 3.3 70B, Qwen 2.5, Gemma 2, Mistral 7B, Phi-3) | https://openrouter.ai/keys |
+| SiliconFlow | Qwen2.5-7B, GLM-4-9B, Yi-1.5-9B (free tier) | https://cloud.siliconflow.cn/account/ak |
+| Google Gemini | Gemini 2.0 Flash / 1.5 Flash free tier | https://aistudio.google.com/apikey |
+| Groq | Llama 3.3 70B, Llama 3.1 8B, Mixtral (free tier) | https://console.groq.com/keys |
+| DeepSeek | — (very low cost) | https://platform.deepseek.com/api_keys |
+| Qwen / DashScope | Qwen-Turbo free quota | https://dashscope.console.aliyun.com/apiKey |
+| Moonshot / Kimi | — | https://platform.moonshot.cn/console/api-keys |
+| Z.ai / GLM | GLM-4-Flash (free) | https://open.bigmodel.cn/usercenter/apikeys |
+| MiniMax | — | https://platform.minimaxi.com/user-center/basic-information/interface-key |
+| StepFun | Step-1-Flash (free) | https://platform.stepfun.com/interface-key |
+| OpenAI | — | https://platform.openai.com/api-keys |
+| Anthropic | — | https://console.anthropic.com/settings/keys |
+| Mistral | Mistral Small / Open models free tier | https://console.mistral.ai/api-keys |
+
+**Prefer free models** toggle (top of the tab): when on, routing always picks a provider's
+free-tier model first and only falls back to a paid model if no free model is available.
+
+**Routing order.** The app tries every provider you configured, in the order shown in the panel,
+and moves to the next one on any failure. Drag-free: just fill in whichever ones you have.
+If a key is rejected for auth reasons the provider is skipped immediately rather than retried.
+
+**Keyless path.** Install Ollama, run `ollama serve`, pull a model (`ollama pull llama3.2`),
+then in the panel click **Detect Ollama models**. No key needed at all.
+
+### Tab 2 — Integrations
+
+**GitHub personal access token (full access).**
+This is the field for your PAT. Paste it, click **Verify**, and the panel shows your login,
+name, and the scopes the token actually carries.
+
+Create the token at https://github.com/settings/tokens with these scopes:
+
+```
+repo        (full control of private + public repositories)
+workflow    (read/write GitHub Actions workflows)
+read:org    (read organisation membership)
+```
+
+Add `admin:repo_hook`, `gist`, `delete_repo`, or `packages` if you want agents to manage
+those too. Once verified, agents can:
+
+- list your repos
+- read and write files (auto-handles create-vs-update blob SHAs)
+- create repositories
+- open issues
+- list workflow runs
+- call any other GitHub REST endpoint through the raw escape hatch
+
+**Firecrawl.** Paste a key from https://firecrawl.dev/app/api-keys. When present it becomes the
+first choice for reading any URL, and unlocks site mapping and web search for agents.
+
+**Local browser (Playwright).** Point at your companion service (default `http://127.0.0.1:8787`)
+and press **Connect**. See section 4.
+
+**KlingAI.** Paste your Access Key and Secret Key from https://app.klingai.com/global/dev/
+for image and video generation. Kling requires JWT request signing, which the companion service
+performs locally — the secret never leaves your machine over the network.
+
+---
+
+## 4. Local browser companion (Playwright + KlingAI signing)
+
+The companion is a small local service that gives agents a real Chromium browser they can
+open on demand, and signs KlingAI requests.
+
+```bash
+cd companion
+npm install
+npx playwright install chromium
+npm start
+```
+
+It listens on `127.0.0.1:8787` and only accepts requests from `https://fame510.github.io`
+and localhost dev origins.
+
+Agent-callable actions: `open`, `read`, `click`, `type`, `screenshot`, `close`.
+Set `HEADLESS=false` before `npm start` if you want to watch the browser work.
+
+**Browser security caveat.** Some browsers block requests from an HTTPS page to
+`http://localhost`. If **Connect** fails from the live URL, either:
+
+- run the app locally (`npm install && npm run dev`, then open `http://localhost:5173`), or
+- expose the companion over HTTPS with a tunnel (e.g. `cloudflared tunnel --url http://127.0.0.1:8787`)
+  and paste the HTTPS URL into the Playwright field.
+
+Chrome also lets you allowlist it via
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`.
+
+---
+
+## 5. Live mind map
+
+When a swarm, chain, or multi-agent run starts, the mind-map drawer opens automatically.
+It draws a radial graph where each node is an agent or step, animated by state:
+
+- **queued** — dim, waiting
+- **running** — pulsing ring, animated connector
+- **done** — solid, filled
+- **error** — red outline
+- **skipped** — faded
+
+A step rail beside the graph lists each node with its provider, model, and duration so you can
+see exactly which agent produced which output. Toggle the drawer from the floating dock.
+
+---
+
+## 6. Local development
 
 ```bash
 npm install
-npm run dev      # builds the agent index, then starts Vite on :3000
+npm run dev          # http://localhost:5173
 ```
 
-Enter your keys in the same vault UI. Local storage is per-origin, so your
-`localhost` keys and your Pages keys are stored separately.
-
-Build a production bundle locally:
+`npm run dev` runs the agent indexer first, so new markdown personas appear immediately.
+Adding an agent is still just: drop a `.md` file in the right division folder and rebuild.
 
 ```bash
-npm run build
-npm run preview
+npm run build        # index + production build into dist/
 ```
 
-## 6. Web page reading
+---
 
-Browsers enforce CORS, so the app cannot read arbitrary pages directly. Pasting
-a URL into a prompt routes the read through the proxy prefix configured in the
-vault (default `https://r.jina.ai/`), then falls back to a direct request for
-sites that permit it. Replace the prefix with your own proxy if you prefer.
+## 7. Security notes
 
-## 7. Troubleshooting
+- Nothing is committed to this repository. All keys live in your browser's local storage
+  under `agentosirus.vault.v2`, on the device where you typed them.
+- Because this is a static app, keys are visible in your own browser devtools. That's expected.
+  Set spend limits on each provider dashboard and rotate keys you've shared.
+- Your GitHub PAT has real write power. Prefer a fine-grained token scoped to the specific
+  repositories you want agents to touch, rather than a classic all-repo token.
+- Use **Clear all** in the settings console to wipe the vault on a shared machine.
 
-**Blank page after deploy** — Confirm Settings → Pages source is **GitHub Actions**,
-and check that the deploy workflow succeeded under the Actions tab.
+---
 
-**"No AI provider key configured"** — Open the vault and save at least one key.
+## 8. Troubleshooting
 
-**A key fails the Test** — The exact provider error is shown under the field.
-`401`/`403` means the key is wrong or lacks access; try another tier.
-
-**Agents list is empty** — The index build step did not run. Re-run the deploy
-workflow; `npm run build` runs `build:index` automatically.
+| Symptom | Fix |
+|---|---|
+| Deploy run fails on the Pages configuration step | Pages source isn't set to GitHub Actions yet — see section 1 |
+| Agents list is empty | The indexer found no markdown; confirm agent folders are present and rerun the build |
+| Every chat fails | No provider configured, or all keys rejected. Open Settings → AI Models and use **Test** on each one |
+| Playwright **Connect** fails | Companion not running, or HTTPS→localhost blocked — see section 4 |
+| KlingAI errors | Kling needs the companion running for JWT signing |
+| Scraping returns nothing | Add a Firecrawl key, or start the companion so Playwright can render the page |
