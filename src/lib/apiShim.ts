@@ -2,14 +2,16 @@
  * Static-hosting API shim.
  *
  * The React components call /api/divisions, /api/agents, /api/agents/:cat/:id,
- * /api/scrape, /api/chat and /api/chain. On GitHub Pages there is no server to
- * answer those, so this module patches window.fetch and answers them locally
- * using the prebuilt agent index plus the browser-side provider chain.
+ * /api/scrape, /api/chat and /api/chain. On static hosting there is no server,
+ * so this module patches window.fetch and answers those routes locally using
+ * the prebuilt agent index plus the browser-side provider chain.
  *
- * Installing this keeps every existing component untouched.
+ * It also publishes progress to the activity bus, which drives the live mind map.
  */
 import { generate, MissingKeyError, LlmMessage } from "./llm";
 import { loadConfig } from "./keyVault";
+import { firecrawl, playwright } from "./integrations";
+import { startRun, endRun, addNode, updateNode, linkNodes } from "./activityBus";
 
 interface AgentMeta {
   id: string;
@@ -34,6 +36,8 @@ interface ChainStep {
   emoji: string;
   task: string;
   output: string;
+  provider?: string;
+  model?: string;
 }
 
 const BASE = import.meta.env.BASE_URL || "/";
@@ -85,11 +89,30 @@ function stripHtml(html: string): string {
 }
 
 /**
- * Browsers enforce CORS, so a direct cross-origin page fetch usually fails.
- * We try a read-only text proxy first (configurable in Settings), then fall
- * back to a direct request for sites that allow it.
+ * Reads a page using the best tool available:
+ *   1. Firecrawl, when a key is saved (most reliable).
+ *   2. The local Playwright companion, when running (executes JavaScript).
+ *   3. A configurable read proxy, then a direct fetch.
  */
-async function scrapeUrl(url: string): Promise<string> {
+async function readUrl(url: string): Promise<string> {
+  if (firecrawl.available) {
+    try {
+      const text = await firecrawl.scrape(url);
+      if (text) return text;
+    } catch {
+      // fall through
+    }
+  }
+
+  try {
+    if (await playwright.available()) {
+      const text = await playwright.read(url);
+      if (text) return text;
+    }
+  } catch {
+    // fall through
+  }
+
   const proxy = loadConfig().corsProxy;
   const attempts: string[] = [];
   if (proxy) attempts.push(proxy.replace(/\/?$/, "/") + url);
@@ -103,10 +126,11 @@ async function scrapeUrl(url: string): Promise<string> {
       const text = /<[a-z][\s\S]*>/i.test(body.slice(0, 2000)) ? stripHtml(body) : body.trim().slice(0, 30000);
       if (text) return text;
     } catch {
-      // try the next strategy
+      // try next strategy
     }
   }
-  return "[Could not read " + url + " from the browser. The site blocks cross-origin reads; set a proxy in Settings.]";
+
+  return "[Could not read " + url + ". Add a Firecrawl key or start the browser companion in Settings.]";
 }
 
 async function augmentWithUrls(message: string): Promise<{ message: string; context: string }> {
@@ -116,7 +140,7 @@ async function augmentWithUrls(message: string): Promise<{ message: string; cont
   let context = "";
   for (const url of urls.slice(0, 3)) {
     context += "\n\n--- INLINE READ OF " + url + " ---\n";
-    context += await scrapeUrl(url);
+    context += await readUrl(url);
     context += "\n--- END INLINE READ ---\n";
   }
   return {
@@ -135,11 +159,22 @@ function errorResponse(err: unknown): Response {
 }
 
 async function handleChat(body: Record<string, unknown>): Promise<Response> {
+  const message = String(body.message || "");
+  const history = (body.history as LlmMessage[]) || [];
+  const systemInstruction = body.systemInstruction as string | undefined;
+  const agentName = String(body.agentName || "Assistant");
+  const agentEmoji = String(body.agentEmoji || "\u{1F4AC}");
+
+  startRun(message.slice(0, 110) || "Direct conversation");
+  addNode({ id: "solo", label: agentName, emoji: agentEmoji, state: "thinking", detail: "Reading the request" });
+
   try {
-    const message = String(body.message || "");
-    const history = (body.history as LlmMessage[]) || [];
-    const systemInstruction = body.systemInstruction as string | undefined;
     const augmented = await augmentWithUrls(message);
+    if (augmented.context) {
+      updateNode("solo", { detail: "Reading linked pages" });
+    }
+
+    updateNode("solo", { state: "streaming", detail: "Composing the response" });
 
     const result = await generate({
       message: augmented.message,
@@ -150,15 +185,28 @@ async function handleChat(body: Record<string, unknown>): Promise<Response> {
       maxOutputTokens: 2048
     });
 
+    updateNode("solo", {
+      state: "done",
+      detail: "Answered via " + result.provider,
+      provider: result.provider,
+      model: result.model
+    });
+    endRun();
+
     return json({ text: result.text, provider: result.provider, model: result.model });
   } catch (err) {
+    updateNode("solo", { state: "error", detail: (err as Error).message.slice(0, 120) });
+    endRun();
     return errorResponse(err);
   }
 }
 
 async function handleChain(body: Record<string, unknown>): Promise<Response> {
+  const message = String(body.message || "");
+  startRun(message.slice(0, 110) || "Swarm workflow");
+  addNode({ id: "planner", label: "Swarm Architect", emoji: "\u{1F9E9}", state: "thinking", detail: "Selecting specialists" });
+
   try {
-    const message = String(body.message || "");
     const index = await loadIndex();
     const roster = index.agents.map((a) => ({
       id: a.id,
@@ -168,6 +216,7 @@ async function handleChain(body: Record<string, unknown>): Promise<Response> {
     }));
 
     const augmented = await augmentWithUrls(message);
+    if (augmented.context) updateNode("planner", { detail: "Read linked sources" });
 
     const coordinatorInstruction =
       'You are the Lead Swarm Architect of "The Agency". Analyze the task and compile a pipeline of up to 3 specialists to solve it sequentially.\n\n' +
@@ -178,10 +227,8 @@ async function handleChain(body: Record<string, unknown>): Promise<Response> {
 
     const planResult = await generate({
       message:
-        "User Query:\n" +
-        message +
-        "\n\nFetched context (if any):\n" +
-        augmented.context +
+        "User Query:\n" + message +
+        "\n\nFetched context (if any):\n" + augmented.context +
         "\n\nTask: orchestrate the specialist swarm and return a JSON workflow plan.",
       systemInstruction: coordinatorInstruction,
       temperature: 0.2,
@@ -201,13 +248,39 @@ async function handleChain(body: Record<string, unknown>): Promise<Response> {
     const chain = Array.isArray(plan.chain) ? plan.chain.slice(0, 3) : [];
     if (chain.length === 0) throw new Error("The planner returned an empty workflow.");
 
+    updateNode("planner", {
+      state: "done",
+      detail: chain.length + " specialists selected",
+      provider: planResult.provider,
+      model: planResult.model
+    });
+
+    // Seed the map so the whole planned pipeline is visible up front.
+    const resolved = chain
+      .map((step) => ({ step, agent: index.agents.find((a) => a.id === step.agentId) }))
+      .filter((entry) => Boolean(entry.agent));
+
+    resolved.forEach((entry, i) => {
+      const agent = entry.agent as AgentMeta;
+      addNode({
+        id: agent.id,
+        label: agent.name,
+        emoji: agent.emoji || "\u{1F916}",
+        state: "idle",
+        detail: entry.step.task.slice(0, 90)
+      });
+      if (i > 0) {
+        linkNodes((resolved[i - 1].agent as AgentMeta).id, agent.id);
+      }
+    });
+
     const steps: ChainStep[] = [];
     let previousOutput = "";
 
-    for (let i = 0; i < chain.length; i++) {
-      const step = chain[i];
-      const agent = index.agents.find((a) => a.id === step.agentId);
-      if (!agent) continue;
+    for (let i = 0; i < resolved.length; i++) {
+      const { step, agent } = resolved[i] as { step: { agentId: string; task: string }; agent: AgentMeta };
+
+      updateNode(agent.id, { state: "thinking", detail: "Loading specialist brief" });
 
       const systemInstruction =
         (await loadContent(agent)) || "You are " + agent.name + ". Vibe: " + (agent.vibe || "Professional");
@@ -218,33 +291,50 @@ async function handleChain(body: Record<string, unknown>): Promise<Response> {
       if (previousOutput) {
         prompt +=
           "### WORK-IN-PROGRESS DELIVERABLE FROM PREVIOUS AGENT (" +
-          (steps[i - 1]?.name || "prior step") +
-          ")\n" +
-          previousOutput +
+          (steps[i - 1] ? steps[i - 1].name : "prior step") + ")\n" + previousOutput +
           "\n\nInstruction: build directly on top of, audit, or refine the above deliverable into your specialized format. Do not start from scratch. Make the output complete and production-ready.";
       } else {
         prompt += "Instruction: you are the starting agent. Initialize the core architecture, draft, or scaffold.";
       }
 
-      const stepResult = await generate({
-        message: prompt,
-        systemInstruction,
-        temperature: 0.5,
-        maxOutputTokens: 2048
-      });
+      updateNode(agent.id, { state: "streaming", detail: step.task.slice(0, 90) });
 
-      previousOutput = stepResult.text;
-      steps.push({
-        agentId: agent.id,
-        name: agent.name,
-        emoji: agent.emoji || "\u{1F916}",
-        task: step.task,
-        output: stepResult.text
-      });
+      try {
+        const stepResult = await generate({
+          message: prompt,
+          systemInstruction,
+          temperature: 0.5,
+          maxOutputTokens: 2048
+        });
+
+        previousOutput = stepResult.text;
+        updateNode(agent.id, {
+          state: "done",
+          detail: "Delivered " + stepResult.text.length.toLocaleString() + " chars",
+          provider: stepResult.provider,
+          model: stepResult.model
+        });
+
+        steps.push({
+          agentId: agent.id,
+          name: agent.name,
+          emoji: agent.emoji || "\u{1F916}",
+          task: step.task,
+          output: stepResult.text,
+          provider: stepResult.provider,
+          model: stepResult.model
+        });
+      } catch (err) {
+        updateNode(agent.id, { state: "error", detail: (err as Error).message.slice(0, 110) });
+        throw err;
+      }
     }
 
+    endRun();
     return json({ plan: plan.plan || "Multi-agent workflow executed.", steps, finalOutput: previousOutput });
   } catch (err) {
+    updateNode("planner", { state: "error", detail: (err as Error).message.slice(0, 120) });
+    endRun();
     return errorResponse(err);
   }
 }
@@ -283,7 +373,7 @@ async function route(pathname: string, init: RequestInit | undefined): Promise<R
   if (path === "/api/scrape") {
     const url = String(body.url || "");
     if (!url) return json({ error: "No URL provided." }, 400);
-    return json({ text: await scrapeUrl(url) });
+    return json({ text: await readUrl(url) });
   }
 
   if (path === "/api/chat") return handleChat(body);
