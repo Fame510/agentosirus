@@ -8,6 +8,7 @@ export interface Agent {
   category: string;
   filePath: string;
   content?: string;
+  contentFile?: string; // static markdown file emitted at build time
 }
 
 export interface Division {
