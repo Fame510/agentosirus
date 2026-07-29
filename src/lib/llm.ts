@@ -1,12 +1,12 @@
 /**
- * Browser-side port of the three-tier provider chain from server.ts.
+ * Multi-provider routing engine (browser-side).
  *
- * Tier 1: SiliconFlow  ->  Tier 2: OpenRouter  ->  Tier 3: Gemini
- *
- * Keys are read from the local key vault at call time, so a key entered in
- * the UI takes effect on the very next request with no rebuild or reload.
+ * Walks every enabled provider in priority order, and within each provider
+ * walks its model list. Free models come first when "Prefer free models" is on.
+ * The first successful response wins; failures fall through to the next option.
  */
-import { loadConfig, VaultConfig } from "./keyVault";
+import { loadConfig, modelsFor, routableProviders, VaultConfig } from "./keyVault";
+import { PROVIDER_MAP, ProviderDef } from "./providers";
 
 export interface LlmMessage {
   role: "user" | "model" | "assistant" | "system";
@@ -14,9 +14,9 @@ export interface LlmMessage {
 }
 
 export interface GenerateParams {
-  systemInstruction?: string;
-  history?: LlmMessage[];
   message: string;
+  history?: LlmMessage[];
+  systemInstruction?: string;
   temperature?: number;
   maxOutputTokens?: number;
   json?: boolean;
@@ -28,22 +28,13 @@ export interface GenerateResult {
   model: string;
 }
 
-const TIMEOUT_MS = 45000;
+const TIMEOUT_MS = 60000;
 
-function toChatMessages(params: GenerateParams): Array<{ role: string; content: string }> {
-  const messages: Array<{ role: string; content: string }> = [];
-  if (params.systemInstruction) {
-    messages.push({ role: "system", content: params.systemInstruction });
+export class MissingKeyError extends Error {
+  constructor() {
+    super("No AI provider is enabled yet. Open Settings and add a key, or enable Ollama to run locally.");
+    this.name = "MissingKeyError";
   }
-  for (const entry of params.history || []) {
-    if (!entry || !entry.text) continue;
-    messages.push({
-      role: entry.role === "model" || entry.role === "assistant" ? "assistant" : "user",
-      content: entry.text
-    });
-  }
-  messages.push({ role: "user", content: params.message });
-  return messages;
 }
 
 function timeoutSignal(ms: number): AbortSignal {
@@ -52,77 +43,68 @@ function timeoutSignal(ms: number): AbortSignal {
   return controller.signal;
 }
 
-function uniqueModels(preferred: string, fallbacks: string[]): string[] {
-  const list = [preferred, ...fallbacks].filter(Boolean);
-  return Array.from(new Set(list));
+function chatMessages(params: GenerateParams): Array<{ role: string; content: string }> {
+  const out: Array<{ role: string; content: string }> = [];
+  if (params.systemInstruction) out.push({ role: "system", content: params.systemInstruction });
+  for (const entry of params.history || []) {
+    if (!entry || !entry.text) continue;
+    out.push({
+      role: entry.role === "model" || entry.role === "assistant" ? "assistant" : "user",
+      content: entry.text
+    });
+  }
+  out.push({ role: "user", content: params.message });
+  return out;
 }
 
-async function callOpenAiCompatible(
-  label: string,
+function isFatalAuth(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+async function callOpenAiStyle(
+  def: ProviderDef,
   endpoint: string,
   apiKey: string,
-  models: string[],
-  params: GenerateParams,
-  extraHeaders: Record<string, string> = {}
-): Promise<GenerateResult> {
-  const messages = toChatMessages(params);
-  let lastError: Error | null = null;
+  model: string,
+  params: GenerateParams
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages: chatMessages(params),
+    temperature: params.temperature ?? 0.7,
+    max_tokens: params.maxOutputTokens || 2048
+  };
+  if (params.json) body.response_format = { type: "json_object" };
 
-  for (const model of models) {
-    const body: Record<string, unknown> = {
-      model,
-      messages,
-      temperature: params.temperature ?? 0.7,
-      max_tokens: params.maxOutputTokens || 2048
-    };
-    if (params.json) body.response_format = { type: "json_object" };
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...(def.headers || {}) };
+  if (apiKey) headers.Authorization = "Bearer " + apiKey;
+  if (def.id === "openrouter") headers["HTTP-Referer"] = window.location.origin;
 
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + apiKey,
-          "Content-Type": "application/json",
-          ...extraHeaders
-        },
-        body: JSON.stringify(body),
-        signal: timeoutSignal(TIMEOUT_MS)
-      });
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: timeoutSignal(TIMEOUT_MS)
+  });
 
-      if (!response.ok) {
-        const detail = await response.text();
-        if (response.status === 401 || response.status === 403) {
-          throw new Error(label + " rejected the key (HTTP " + response.status + "). Check it in Settings.");
-        }
-        lastError = new Error(label + " error " + response.status + ": " + detail.slice(0, 300));
-        continue;
-      }
-
-      const data = await response.json();
-      const text: string = data?.choices?.[0]?.message?.content || "";
-      if (!text) {
-        lastError = new Error(label + " returned an empty response from " + model + ".");
-        continue;
-      }
-      return { text, provider: label, model };
-    } catch (err) {
-      const error = err as Error;
-      if (/rejected the key/.test(error.message)) throw error;
-      lastError = error;
-    }
+  if (!response.ok) {
+    const detail = await response.text();
+    const err = new Error(def.label + " " + response.status + ": " + detail.slice(0, 240));
+    (err as Error & { fatal?: boolean }).fatal = isFatalAuth(response.status);
+    throw err;
   }
 
-  throw lastError || new Error(label + " request failed.");
+  const data = await response.json();
+  return data?.choices?.[0]?.message?.content || "";
 }
 
-async function callGemini(apiKey: string, preferredModel: string, params: GenerateParams): Promise<GenerateResult> {
-  const models = uniqueModels(preferredModel, [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-flash-latest"
-  ]);
-
+async function callGemini(
+  def: ProviderDef,
+  endpoint: string,
+  apiKey: string,
+  model: string,
+  params: GenerateParams
+): Promise<string> {
   const contents: Array<{ role: string; parts: Array<{ text: string }> }> = [];
   for (const entry of params.history || []) {
     if (!entry || !entry.text) continue;
@@ -133,150 +115,159 @@ async function callGemini(apiKey: string, preferredModel: string, params: Genera
   }
   contents.push({ role: "user", parts: [{ text: params.message }] });
 
-  let lastError: Error | null = null;
-
-  for (const model of models) {
-    const body: Record<string, unknown> = {
-      contents,
-      generationConfig: {
-        temperature: params.temperature ?? 0.7,
-        maxOutputTokens: params.maxOutputTokens || 2048,
-        ...(params.json ? { responseMimeType: "application/json" } : {})
-      }
-    };
-    if (params.systemInstruction) {
-      body.systemInstruction = { parts: [{ text: params.systemInstruction }] };
+  const body: Record<string, unknown> = {
+    contents,
+    generationConfig: {
+      temperature: params.temperature ?? 0.7,
+      maxOutputTokens: params.maxOutputTokens || 2048,
+      ...(params.json ? { responseMimeType: "application/json" } : {})
     }
+  };
+  if (params.systemInstruction) body.systemInstruction = { parts: [{ text: params.systemInstruction }] };
 
-    try {
-      const url =
-        "https://generativelanguage.googleapis.com/v1beta/models/" +
-        encodeURIComponent(model) +
-        ":generateContent?key=" +
-        encodeURIComponent(apiKey);
+  const url = endpoint.replace(/\/$/, "") + "/" + encodeURIComponent(model) +
+    ":generateContent?key=" + encodeURIComponent(apiKey);
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: timeoutSignal(TIMEOUT_MS)
-      });
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: timeoutSignal(TIMEOUT_MS)
+  });
 
-      if (!response.ok) {
-        const detail = await response.text();
-        if (response.status === 400 && /API key not valid/i.test(detail)) {
-          throw new Error("Gemini rejected the key. Check it in Settings.");
-        }
-        lastError = new Error("Gemini error " + response.status + ": " + detail.slice(0, 300));
-        continue;
-      }
-
-      const data = await response.json();
-      const parts = data?.candidates?.[0]?.content?.parts || [];
-      const text = parts.map((p: { text?: string }) => p.text || "").join("").trim();
-      if (!text) {
-        lastError = new Error("Gemini returned an empty response from " + model + ".");
-        continue;
-      }
-      return { text, provider: "Gemini", model };
-    } catch (err) {
-      const error = err as Error;
-      if (/rejected the key/.test(error.message)) throw error;
-      lastError = error;
-    }
+  if (!response.ok) {
+    const detail = await response.text();
+    const err = new Error(def.label + " " + response.status + ": " + detail.slice(0, 240));
+    (err as Error & { fatal?: boolean }).fatal =
+      isFatalAuth(response.status) || /API key not valid/i.test(detail);
+    throw err;
   }
 
-  throw lastError || new Error("Gemini request failed.");
+  const data = await response.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  return parts.map((p: { text?: string }) => p.text || "").join("").trim();
 }
 
-export class MissingKeyError extends Error {
-  constructor() {
-    super("No AI provider key configured. Open Settings and add a SiliconFlow, OpenRouter, or Gemini key.");
-    this.name = "MissingKeyError";
+async function callAnthropic(
+  def: ProviderDef,
+  endpoint: string,
+  apiKey: string,
+  model: string,
+  params: GenerateParams
+): Promise<string> {
+  const messages: Array<{ role: string; content: string }> = [];
+  for (const entry of params.history || []) {
+    if (!entry || !entry.text) continue;
+    messages.push({
+      role: entry.role === "model" || entry.role === "assistant" ? "assistant" : "user",
+      content: entry.text
+    });
   }
+  messages.push({ role: "user", content: params.message });
+
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    max_tokens: params.maxOutputTokens || 2048,
+    temperature: params.temperature ?? 0.7
+  };
+  if (params.systemInstruction) body.system = params.systemInstruction;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      ...(def.headers || {})
+    },
+    body: JSON.stringify(body),
+    signal: timeoutSignal(TIMEOUT_MS)
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    const err = new Error(def.label + " " + response.status + ": " + detail.slice(0, 240));
+    (err as Error & { fatal?: boolean }).fatal = isFatalAuth(response.status);
+    throw err;
+  }
+
+  const data = await response.json();
+  const blocks = data?.content || [];
+  return blocks.map((b: { text?: string }) => b.text || "").join("").trim();
+}
+
+async function callOne(
+  def: ProviderDef,
+  endpoint: string,
+  apiKey: string,
+  model: string,
+  params: GenerateParams
+): Promise<string> {
+  if (def.protocol === "gemini") return callGemini(def, endpoint, apiKey, model, params);
+  if (def.protocol === "anthropic") return callAnthropic(def, endpoint, apiKey, model, params);
+  return callOpenAiStyle(def, endpoint, apiKey, model, params);
 }
 
 export async function generate(params: GenerateParams, override?: VaultConfig): Promise<GenerateResult> {
   const config = override || loadConfig();
+  const order = routableProviders(config);
+  if (order.length === 0) throw new MissingKeyError();
+
   const failures: string[] = [];
 
-  if (!config.siliconflowKey && !config.openrouterKey && !config.geminiKey) {
-    throw new MissingKeyError();
-  }
+  for (const id of order) {
+    const def = PROVIDER_MAP[id];
+    const settings = config.providers[id];
+    const models = modelsFor(id, config);
 
-  if (config.siliconflowKey) {
-    try {
-      return await callOpenAiCompatible(
-        "SiliconFlow",
-        "https://api.siliconflow.cn/v1/chat/completions",
-        config.siliconflowKey,
-        uniqueModels(config.siliconflowModel, [
-          "deepseek-ai/DeepSeek-V3",
-          "Qwen/Qwen2.5-Coder-32B-Instruct",
-          "THUDM/glm-4-9b-chat"
-        ]),
-        params
-      );
-    } catch (err) {
-      failures.push((err as Error).message);
+    for (const model of models) {
+      try {
+        const text = await callOne(def, settings.endpoint, settings.key, model, params);
+        if (text && text.trim()) return { text, provider: def.label, model };
+        failures.push(def.label + "/" + model + ": empty response");
+      } catch (err) {
+        const error = err as Error & { fatal?: boolean };
+        failures.push(error.message);
+        // A bad key will fail for every model, so skip the rest of this provider.
+        if (error.fatal) break;
+      }
     }
   }
 
-  if (config.openrouterKey) {
-    try {
-      return await callOpenAiCompatible(
-        "OpenRouter",
-        "https://openrouter.ai/api/v1/chat/completions",
-        config.openrouterKey,
-        uniqueModels(config.openrouterModel, [
-          "deepseek/deepseek-chat:free",
-          "deepseek/deepseek-r1:free",
-          "qwen/qwen-2.5-72b-instruct:free"
-        ]),
-        params,
-        { "HTTP-Referer": window.location.origin, "X-Title": "AgentOsirus" }
-      );
-    } catch (err) {
-      failures.push((err as Error).message);
-    }
-  }
-
-  if (config.geminiKey) {
-    try {
-      return await callGemini(config.geminiKey, config.geminiModel, params);
-    } catch (err) {
-      failures.push((err as Error).message);
-    }
-  }
-
-  throw new Error("All configured providers failed. " + failures.join(" | "));
+  throw new Error("Every enabled provider failed. " + failures.slice(0, 4).join(" | "));
 }
 
-/** Verifies one provider key with a minimal round trip, for the Settings panel. */
-export async function testProvider(
-  provider: "siliconflow" | "openrouter" | "gemini",
-  config: VaultConfig
-): Promise<GenerateResult> {
-  const probe: GenerateParams = { message: "Reply with the single word: READY", maxOutputTokens: 16, temperature: 0 };
+/** Single-provider probe used by the Settings "Test" buttons. */
+export async function testProvider(id: string, config: VaultConfig): Promise<GenerateResult> {
+  const def = PROVIDER_MAP[id];
+  const settings = config.providers[id];
+  const models = modelsFor(id, config);
+  const probe: GenerateParams = {
+    message: "Reply with the single word: READY",
+    maxOutputTokens: 16,
+    temperature: 0
+  };
 
-  if (provider === "siliconflow") {
-    return callOpenAiCompatible(
-      "SiliconFlow",
-      "https://api.siliconflow.cn/v1/chat/completions",
-      config.siliconflowKey,
-      [config.siliconflowModel],
-      probe
-    );
+  let lastError: Error | null = null;
+  for (const model of models.slice(0, 3)) {
+    try {
+      const text = await callOne(def, settings.endpoint, settings.key, model, probe);
+      if (text && text.trim()) return { text: text.trim(), provider: def.label, model };
+      lastError = new Error("Empty response from " + model);
+    } catch (err) {
+      lastError = err as Error;
+    }
   }
-  if (provider === "openrouter") {
-    return callOpenAiCompatible(
-      "OpenRouter",
-      "https://openrouter.ai/api/v1/chat/completions",
-      config.openrouterKey,
-      [config.openrouterModel],
-      probe,
-      { "HTTP-Referer": window.location.origin, "X-Title": "AgentOsirus" }
-    );
-  }
-  return callGemini(config.geminiKey, config.geminiModel, probe);
+  throw lastError || new Error("No model responded.");
+}
+
+/** Lists locally installed Ollama models, for the Settings panel. */
+export async function listOllamaModels(baseEndpoint: string): Promise<string[]> {
+  const root = baseEndpoint.replace(/\/v1\/chat\/completions\/?$/, "");
+  const response = await fetch(root.replace(/\/$/, "") + "/api/tags", {
+    signal: timeoutSignal(8000)
+  });
+  if (!response.ok) throw new Error("Ollama not reachable (HTTP " + response.status + ").");
+  const data = await response.json();
+  return (data?.models || []).map((m: { name?: string }) => m.name || "").filter(Boolean);
 }
